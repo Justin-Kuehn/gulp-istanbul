@@ -13,31 +13,68 @@ var PluginError = gutil.PluginError;
 var PLUGIN_NAME = 'gulp-istanbul';
 var COVERAGE_VARIABLE = '$$cov_' + new Date().getTime() + '$$';
 
-var plugin  = module.exports = function (opts) {
+var plugin = module.exports = function (opts) {
   opts = opts || {};
-  if (!opts.coverageVariable) opts.coverageVariable = COVERAGE_VARIABLE;
-  var fileMap = {};
-
-  hook.hookRequire(function (path) {
-    return !!fileMap[path];
-  }, function (code, path) {
-    return fileMap[path];
+  _.defaults(opts, {
+    coverageVariable: COVERAGE_VARIABLE,
+    instrumenter: istanbul.Instrumenter
   });
+  opts.includeUntested = opts.includeUntested === true;
 
-  var instrumenter = new istanbul.Instrumenter(opts);
+  var instrumenter = new opts.instrumenter(opts);
 
   return through(function (file, enc, cb) {
-    if (!file.contents instanceof Buffer) {
-      return cb(new PluginError(PLUGIN_NAME, 'streams not supported'), undefined);
+    cb = _.once(cb);
+    if (!(file.contents instanceof Buffer)) {
+      return cb(new PluginError(PLUGIN_NAME, 'streams not supported'));
     }
 
     instrumenter.instrument(file.contents.toString(), file.path, function (err, code) {
-      if (!err) file.contents = new Buffer(code);
+      if (err) {
+        return cb(new PluginError(
+          PLUGIN_NAME,
+          'Unable to parse ' + file.path + '\n\n' + err.message + '\n'
+        ));
+      }
 
-      fileMap[file.path] = file.contents.toString();
+      file.contents = new Buffer(code);
+
+      // Parse the blank coverage object from the instrumented file and save it
+      // to the global coverage variable to enable reporting on non-required
+      // files, a workaround for
+      // https://github.com/gotwarlost/istanbul/issues/112
+      if (opts.includeUntested) {
+        var instrumentedSrc = file.contents.toString();
+        var covStubRE = /\{.*"path".*"fnMap".*"statementMap".*"branchMap".*\}/g;
+        var covStubMatch = covStubRE.exec(instrumentedSrc);
+        if (covStubMatch !== null) {
+          var covStub = JSON.parse(covStubMatch[0]);
+          global[opts.coverageVariable] = global[opts.coverageVariable] || {};
+          global[opts.coverageVariable][path.resolve(file.path)] = covStub;
+        }
+      }
 
       return cb(err, file);
     });
+  });
+};
+
+plugin.hookRequire = function (options) {
+  var fileMap = {};
+
+  istanbul.hook.unhookRequire();
+  istanbul.hook.hookRequire(function (path) {
+    return !!fileMap[path];
+  }, function (code, path) {
+    return fileMap[path];
+  }, options);
+
+  return through(function (file, enc, cb) {
+    // If the file is already required, delete it from the cache otherwise the covered
+    // version will be ignored.
+    delete require.cache[path.resolve(file.path)];
+    fileMap[file.path] = file.contents.toString();
+    return cb();
   });
 };
 
